@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Slant 灯泡提示",
+  "version": "1.1.0",
+  "description": "在 puzzle-slant 当前局面上运行离线人类逻辑求解器，并用图形显示下一步。",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://puzzle-slant.com/*",
+        "https://*.puzzle-slant.com/*"
+      ],
+      "js": ["page-bridge.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://puzzle-slant.com/*",
+        "https://*.puzzle-slant.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    }
+  ]
+}
