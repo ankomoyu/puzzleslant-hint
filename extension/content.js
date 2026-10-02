@@ -340,6 +340,7 @@
 	function difficultyForStep(step) {
 		if (step.rule.id.startsWith("SL-WDG-")) return STEP_DIFFICULTIES["same-direction"];
 		if (step.rule.id === "SL-CNT-001") return STEP_DIFFICULTIES.intro;
+		if (step.rule.id === "SL-CNT-020") return STEP_DIFFICULTIES.advanced;
 		if (step.rule.id === "SL-CNT-010") return step.involved.vertices.length === 2 ? STEP_DIFFICULTIES.basic : STEP_DIFFICULTIES.advanced;
 		if (step.rule.id === "SL-CYC-201") {
 			const lengths = immediateCycleLengths(step);
@@ -921,11 +922,215 @@
 		return steps;
 	}
 	//#endregion
+	//#region src/domain/rules/diamond-count.ts
+	function outerState(board, outer) {
+		const connected = [];
+		const excluded = [];
+		const unknown = [];
+		for (const entry of outer) {
+			const fixed = fixedOrientation(getCellDomain(board, entry.cell));
+			if (fixed === null) unknown.push(entry);
+			else if (fixed === entry.connectOrientation) connected.push(entry);
+			else excluded.push(entry);
+		}
+		return {
+			connected,
+			excluded,
+			unknown
+		};
+	}
+	/** 固定四提示菱形：内部四格对横、纵两组贡献相同，相减后只剩外侧格。 */
+	function findDiamondCountingSteps(board, affectedCells) {
+		const affectedCenters = affectedCells === void 0 ? void 0 : /* @__PURE__ */ new Set();
+		for (const cell of affectedCells ?? []) for (let r = Math.max(1, cell.r - 1); r <= Math.min(board.height - 1, cell.r + 2); r += 1) for (let c = Math.max(1, cell.c - 1); c <= Math.min(board.width - 1, cell.c + 2); c += 1) affectedCenters.add(`${r},${c}`);
+		const centers = affectedCenters === void 0 ? Array.from({ length: Math.max(0, board.height - 1) }, (_, r) => Array.from({ length: Math.max(0, board.width - 1) }, (_, c) => ({
+			r: r + 1,
+			c: c + 1
+		}))).flat() : [...affectedCenters].map((key) => {
+			const [r, c] = key.split(",").map(Number);
+			return {
+				r,
+				c
+			};
+		}).sort((a, b) => a.r - b.r || a.c - b.c);
+		const steps = [];
+		for (const center of centers) {
+			const { r, c } = center;
+			const west = {
+				r,
+				c: c - 1
+			};
+			const east = {
+				r,
+				c: c + 1
+			};
+			const north = {
+				r: r - 1,
+				c
+			};
+			const south = {
+				r: r + 1,
+				c
+			};
+			const vertices = [
+				west,
+				east,
+				north,
+				south
+			];
+			const values = vertices.map((v) => board.clues[v.r]?.[v.c]);
+			if (values.some((value) => value === null || value === void 0)) continue;
+			const horizontalSum = values[0] + values[1];
+			const verticalSum = values[2] + values[3];
+			const delta = horizontalSum - verticalSum;
+			const innerCells = [
+				{
+					r: r - 1,
+					c: c - 1
+				},
+				{
+					r: r - 1,
+					c
+				},
+				{
+					r,
+					c: c - 1
+				},
+				{
+					r,
+					c
+				}
+			];
+			const innerKeys = new Set(innerCells.map(cellKey$1));
+			const outerFor = (group) => group.flatMap((vertex) => incidentCells(board.width, board.height, vertex).filter((entry) => !innerKeys.has(cellKey$1(entry.cell))).map((entry) => ({
+				...entry,
+				vertex
+			})));
+			const horizontalOuter = outerFor([west, east]);
+			const verticalOuter = outerFor([north, south]);
+			const horizontal = outerState(board, horizontalOuter);
+			const vertical = outerState(board, verticalOuter);
+			const residual = delta - horizontal.connected.length + vertical.connected.length;
+			const h = horizontal.unknown.length;
+			const v = vertical.unknown.length;
+			const contradiction = residual < -v || residual > h;
+			if (!contradiction && (h + v === 0 || residual !== h && residual !== -v)) continue;
+			const horizontalConnects = residual === h;
+			const conclusions = contradiction ? [{
+				kind: "report-contradiction",
+				code: "E-DIAMOND-COUNT",
+				messageZh: `以第 ${r + 1} 行第 ${c + 1} 列顶点为中心的菱形计数矛盾：外侧剩余贡献差需要 ${residual}，但只能在 ${-v} 到 ${h} 之间。`
+			}] : [...horizontal.unknown.map((entry) => ({
+				entry,
+				connects: horizontalConnects
+			})), ...vertical.unknown.map((entry) => ({
+				entry,
+				connects: !horizontalConnects
+			}))].map(({ entry, connects }) => ({
+				kind: "assign-orientation",
+				cell: entry.cell,
+				orientation: connects ? entry.connectOrientation : oppositeOrientation(entry.connectOrientation),
+				beforeDomain: getCellDomain(board, entry.cell)
+			}));
+			const calculation = `左右提示之和 ${horizontalSum} 减去上下提示之和 ${verticalSum}，得到外侧贡献差 ${delta}。内部四格对两组贡献相同，可以抵消。扣除左右已接入 ${horizontal.connected.length} 条、上下已接入 ${vertical.connected.length} 条后，剩余差为 ${residual}；左右还剩 ${h} 格，上下还剩 ${v} 格。`;
+			const rendered = contradiction ? `${calculation}${conclusions[0].kind === "report-contradiction" ? conclusions[0].messageZh : ""}` : `${calculation}已达到差值的${horizontalConnects ? "上限" : "下限"}，所以左右剩余外侧格全部${horizontalConnects ? "接入" : "避开"}，上下剩余外侧格全部${horizontalConnects ? "避开" : "接入"}。`;
+			const outer = [...horizontalOuter, ...verticalOuter];
+			steps.push({
+				schemaVersion: 1,
+				stepId: `SL-CNT-020@${board.revision}:V${r},${c}`,
+				origin: "catalog-logic",
+				status: "proposed",
+				rule: {
+					id: "SL-CNT-020",
+					version: "1.0.0"
+				},
+				variant: {
+					id: "PAT-DIAMOND-COUNT",
+					displayName: "菱形联合计数"
+				},
+				beforeRevision: board.revision,
+				premises: {
+					center,
+					west,
+					east,
+					north,
+					south,
+					clueValues: values,
+					innerCells,
+					horizontalOuter,
+					verticalOuter,
+					horizontalSum,
+					verticalSum,
+					delta,
+					knownHorizontalContribution: horizontal.connected.length,
+					knownVerticalContribution: vertical.connected.length,
+					remainingHorizontal: h,
+					remainingVertical: v,
+					residual
+				},
+				conclusions,
+				involved: {
+					vertices,
+					cells: [...innerCells, ...outer.map((entry) => entry.cell)]
+				},
+				highlight: [
+					{
+						role: "clue",
+						vertices
+					},
+					{
+						role: "constant-inner",
+						cells: innerCells
+					},
+					{
+						role: "outer-cell",
+						cells: outer.map((entry) => entry.cell)
+					},
+					{
+						role: "known-contribution",
+						cells: [...horizontal.connected, ...vertical.connected].map((entry) => entry.cell)
+					},
+					{
+						role: "known-exclusion",
+						cells: [...horizontal.excluded, ...vertical.excluded].map((entry) => entry.cell)
+					},
+					{
+						role: "target",
+						cells: conclusions.flatMap((entry) => entry.kind === "report-contradiction" ? [] : [entry.cell])
+					}
+				],
+				explanation: {
+					locale: "zh-CN",
+					title: "菱形联合计数",
+					templateId: "count.diamond.difference",
+					parameters: {
+						horizontalSum,
+						verticalSum,
+						delta,
+						residual,
+						h,
+						v
+					},
+					rendered
+				},
+				sortKey: [
+					25,
+					4,
+					r,
+					c,
+					`D${r},${c}`
+				]
+			});
+		}
+		return steps;
+	}
+	//#endregion
 	//#region src/domain/rules/counting.ts
 	function findNextCountingStep(board, options = {}) {
 		const single = [...findSingleClueSteps(board)].sort(compareReasoningSteps)[0];
 		if (single !== void 0) return single;
-		return findFirstStraightChainStep(board, options.chainIndex ?? buildStraightChainIndex(board), options.affectedCells);
+		const index = options.chainIndex ?? buildStraightChainIndex(board);
+		return findFirstStraightChainStep(board, index, options.affectedCells) ?? (options.affectedCells === void 0 ? null : findFirstStraightChainStep(board, index)) ?? [...findDiamondCountingSteps(board, options.affectedCells)].sort(compareReasoningSteps)[0] ?? null;
 	}
 	//#endregion
 	//#region src/domain/rules/cycle-count.ts
@@ -1027,11 +1232,12 @@
 		return analyzeOuter(board, scope.outer, scope.clueSum, scope.internalConstant);
 	}
 	function canProduceConcreteConclusion(state) {
-		return state.unknown.length >= 3 && state.residual > 0 && state.residual === state.unknown.length - 1;
+		return state.unknown.length >= 3 && state.residual > 0 && state.residual < state.unknown.length;
 	}
 	function materializeEligibleChainScope(board, chain) {
 		const state = analyzeOuter(board, chain.outer, chain.clueSum, chain.internalCount);
 		if (!canProduceConcreteConclusion(state)) return null;
+		if (state.residual !== state.unknown.length - 1) return null;
 		const vertices = chainVertices(chain);
 		const values = clueValues(board, vertices);
 		if (!isTwoExtension(values)) return null;
@@ -1078,7 +1284,7 @@
 	function buildStep(board, scope, state, dangerous, witness) {
 		const dangerousCells = new Set(dangerous.map((candidate) => `${candidate.cell.r},${candidate.cell.c}`));
 		const targets = state.unknown.filter((candidate) => !dangerousCells.has(`${candidate.cell.r},${candidate.cell.c}`));
-		if (targets.length === 0 || state.residual !== state.unknown.length - 1) return null;
+		if (targets.length === 0 || state.residual !== targets.length + 1) return null;
 		const conclusions = targets.map((target) => ({
 			kind: "assign-orientation",
 			cell: target.cell,
@@ -1086,16 +1292,22 @@
 			beforeDomain: getCellDomain(board, target.cell)
 		}));
 		const displayVariant = variantFor(scope);
-		const firstVertex = scope.vertices[0] ?? dangerous[0].vertex;
+		const firstVertex = scope.vertices[0];
 		const dangerousDescription = dangerous.map((candidate) => coordinateLabel$1(candidate.cell)).join("和");
 		const targetDescription = targets.length === 1 ? coordinateLabel$1(targets[0]?.cell ?? {
 			r: 0,
 			c: 0
 		}) : `另外 ${targets.length} 个外侧格`;
-		const rendered = `${scopeLabel(scope)}还需要 ${state.residual} 个外侧连接。${dangerousDescription}若同时接入，会与已有的 ${witness.edges.length} 条斜线路径闭合成圈，所以这两个候选至多接入一个。为了凑足 ${state.residual} 个连接，${targetDescription}必须接入。`;
+		const rendered = `${scopeLabel(scope)}还需要 ${state.residual} 个外侧连接。${dangerousDescription}的远端已经由 ${witness.edges.length} 条已有斜线连通，其中任意两个同时接入都会闭圈，所以这 ${dangerous.length} 个候选至多接入一个。为了凑足 ${state.residual} 个连接，${targetDescription}必须接入。`;
+		const dangerousEvidence = dangerous.map((candidate) => ({
+			cell: candidate.cell,
+			connectOrientation: candidate.connectOrientation,
+			sharedVertex: candidate.vertex,
+			farEndpoint: farEndpoint(candidate)
+		}));
 		return {
 			schemaVersion: 1,
-			stepId: `SL-CYC-202@${board.revision}:${scope.id}:C${dangerous[0].cell.r},${dangerous[0].cell.c}+C${dangerous[1].cell.r},${dangerous[1].cell.c}`,
+			stepId: `SL-CYC-202@${board.revision}:${scope.id}:${dangerous.map((entry) => `C${entry.cell.r},${entry.cell.c}`).join("+")}`,
 			origin: "catalog-logic",
 			status: "proposed",
 			rule: {
@@ -1117,13 +1329,12 @@
 				knownOuterExclusions: state.knownExcluded.length,
 				residualR: state.residual,
 				remainingOuterCandidates: state.unknown.length,
-				dangerousPair: dangerous.map((candidate) => ({
-					cell: candidate.cell,
-					connectOrientation: candidate.connectOrientation,
-					sharedVertex: candidate.vertex,
-					farEndpoint: farEndpoint(candidate)
-				})),
-				pairUpperBound: 1,
+				...dangerous.length === 2 ? {
+					dangerousPair: dangerousEvidence,
+					pairUpperBound: 1
+				} : {},
+				dangerousGroup: dangerousEvidence,
+				groupUpperBound: 1,
 				fixedPath: witness
 			},
 			conclusions,
@@ -1173,7 +1384,7 @@
 			explanation: {
 				locale: "zh-CN",
 				title: `${displayVariant.displayName}：其余外侧格必须接入`,
-				templateId: "cycle.count.pair-cap",
+				templateId: dangerous.length === 2 ? "cycle.count.pair-cap" : "cycle.count.group-cap",
 				parameters: {
 					clueValues: scope.clueValues,
 					clueSum: scope.clueSum,
@@ -1200,20 +1411,31 @@
 		const state = providedState ?? analyzeScope(board, scope);
 		if (!canProduceConcreteConclusion(state)) return [];
 		const steps = [];
-		for (let leftIndex = 0; leftIndex < state.unknown.length; leftIndex += 1) {
-			const left = state.unknown[leftIndex];
-			if (left === void 0) continue;
-			for (let rightIndex = leftIndex + 1; rightIndex < state.unknown.length; rightIndex += 1) {
-				const right = state.unknown[rightIndex];
-				if (right === void 0 || !sameVertex(left.vertex, right.vertex)) continue;
-				const leftFar = farEndpoint(left);
-				const rightFar = farEndpoint(right);
-				if (componentIdAt(connectivity, leftFar) !== componentIdAt(connectivity, rightFar)) continue;
-				const witness = findFixedPath(connectivity, leftFar, rightFar);
-				if (witness === null || witness.edges.length === 0) continue;
-				const step = buildStep(board, scope, state, [left, right], witness);
-				if (step !== null) steps.push(step);
+		const groups = /* @__PURE__ */ new Map();
+		for (const candidate of state.unknown) {
+			const component = componentIdAt(connectivity, farEndpoint(candidate));
+			if (component === componentIdAt(connectivity, candidate.vertex)) continue;
+			const key = `${candidate.vertex.r},${candidate.vertex.c}:${component}`;
+			const group = groups.get(key) ?? [];
+			group.push(candidate);
+			groups.set(key, group);
+		}
+		for (const group of groups.values()) {
+			if (group.length < 2 || state.residual !== state.unknown.length - group.length + 1) continue;
+			const root = farEndpoint(group[0]);
+			const paths = group.slice(1).map((entry) => findFixedPath(connectivity, root, farEndpoint(entry)));
+			if (paths.some((path) => path === null || path.edges.length === 0)) continue;
+			const vertices = /* @__PURE__ */ new Map();
+			const edges = /* @__PURE__ */ new Map();
+			for (const path of paths) {
+				for (const vertex of path.vertices) vertices.set(`${vertex.r},${vertex.c}`, vertex);
+				for (const edge of path.edges) edges.set(`${edge.cell.r},${edge.cell.c}`, edge);
 			}
+			const step = buildStep(board, scope, state, group, {
+				vertices: [...vertices.values()],
+				edges: [...edges.values()]
+			});
+			if (step !== null) steps.push(step);
 		}
 		return steps;
 	}
@@ -3564,12 +3786,12 @@
 	function cellKey(cell) {
 		return `${cell.r},${cell.c}`;
 	}
-	function validCell(width, height, cell) {
+	function validCell$1(width, height, cell) {
 		return cell.r >= 0 && cell.r < height && cell.c >= 0 && cell.c < width;
 	}
 	function uniqueCells(width, height, cells) {
 		const unique = /* @__PURE__ */ new Map();
-		for (const cell of cells) if (validCell(width, height, cell)) unique.set(cellKey(cell), cell);
+		for (const cell of cells) if (validCell$1(width, height, cell)) unique.set(cellKey(cell), cell);
 		return unique;
 	}
 	function safeGap(length, preferred) {
@@ -3642,7 +3864,7 @@
 		if (rects.length !== width * height) return [];
 		const unique = /* @__PURE__ */ new Map();
 		for (const edge of edges) {
-			if (!validCell(width, height, edge.cell)) continue;
+			if (!validCell$1(width, height, edge.cell)) continue;
 			unique.set(`${cellKey(edge.cell)}:${edge.orientation}:${edge.kind}`, edge);
 		}
 		return [...unique.values()].flatMap((edge) => {
@@ -3683,7 +3905,7 @@
 		const points = [];
 		for (let index = 0; index < cells.length; index += 1) {
 			const cell = cells[index];
-			if (cell === void 0 || !validCell(width, height, cell) || seen.has(cellKey(cell))) return empty;
+			if (cell === void 0 || !validCell$1(width, height, cell) || seen.has(cellKey(cell))) return empty;
 			if (index > 0) {
 				const previous = cells[index - 1];
 				if (previous === void 0 || Math.abs(cell.r - previous.r) + Math.abs(cell.c - previous.c) !== 1) return empty;
@@ -3713,12 +3935,13 @@
 	}
 	function viewportPointForVertex(width, height, rects, vertex) {
 		if (rects.length !== width * height || vertex.r < 0 || vertex.r > height || vertex.c < 0 || vertex.c > width) return null;
-		const xRect = vertex.c < width ? rects[vertex.c] : rects[width - 1];
-		const yRect = vertex.r < height ? rects[vertex.r * width] : rects[(height - 1) * width];
-		if (xRect === void 0 || yRect === void 0) return null;
+		const anchorR = Math.min(vertex.r, height - 1);
+		const anchorC = Math.min(vertex.c, width - 1);
+		const anchor = rects[anchorR * width + anchorC];
+		if (anchor === void 0) return null;
 		return {
-			x: vertex.c < width ? xRect.left : xRect.left + xRect.width,
-			y: vertex.r < height ? yRect.top : yRect.top + yRect.height
+			x: vertex.c === anchorC ? anchor.left : anchor.left + anchor.width,
+			y: vertex.r === anchorR ? anchor.top : anchor.top + anchor.height
 		};
 	}
 	function buildVertexHighlightLayout(width, height, rects, vertices) {
@@ -3761,9 +3984,82 @@
 			}];
 		});
 	}
+	function viewportBounds(rects) {
+		if (rects.length === 0) return null;
+		let left = Number.POSITIVE_INFINITY;
+		let top = Number.POSITIVE_INFINITY;
+		let right = Number.NEGATIVE_INFINITY;
+		let bottom = Number.NEGATIVE_INFINITY;
+		for (const rect of rects) {
+			if (rect.width <= 0 || rect.height <= 0) continue;
+			left = Math.min(left, rect.left);
+			top = Math.min(top, rect.top);
+			right = Math.max(right, rect.left + rect.width);
+			bottom = Math.max(bottom, rect.top + rect.height);
+		}
+		return Number.isFinite(left) ? {
+			left,
+			top,
+			right,
+			bottom
+		} : null;
+	}
+	function needsViewportFocus(bounds, viewportWidth, viewportHeight, margin) {
+		const safeMargin = Math.max(0, Math.min(margin, viewportWidth / 3, viewportHeight / 3));
+		return bounds.left < safeMargin || bounds.top < safeMargin || bounds.right > viewportWidth - safeMargin || bounds.bottom > viewportHeight - safeMargin;
+	}
+	//#endregion
+	//#region src/extension/hint/zoom-metrics.ts
+	var MIN_BROWSER_ZOOM = .25;
+	var MAX_BROWSER_ZOOM = 5;
+	function normalizeBrowserZoom(value) {
+		return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.min(MAX_BROWSER_ZOOM, Math.max(MIN_BROWSER_ZOOM, value)) : 1;
+	}
+	/**
+	* 浏览器页面缩放会同时缩小扩展的 CSS 像素。这里把希望保持不变的屏幕尺寸
+	* 换算为当前页面中应使用的 CSS 像素；不改变棋盘坐标本身。
+	*/
+	function hintVisualMetrics(value) {
+		const zoomFactor = normalizeBrowserZoom(value);
+		const cssPixels = (screenPixels) => screenPixels / zoomFactor;
+		return {
+			zoomFactor,
+			lampSize: cssPixels(56),
+			lampOffset: cssPixels(22),
+			lampBorder: cssPixels(2),
+			lampFont: cssPixels(28),
+			badgeSize: cssPixels(22),
+			badgeNegativeOffset: cssPixels(-5),
+			badgeBorder: cssPixels(2),
+			badgeFont: cssPixels(15),
+			hoverShift: cssPixels(-1),
+			lampShadowY: cssPixels(6),
+			lampShadowBlur: cssPixels(22),
+			badgeShadowY: cssPixels(2),
+			badgeShadowBlur: cssPixels(7),
+			focusRing: cssPixels(5),
+			focusShadowY: cssPixels(7),
+			focusShadowBlur: cssPixels(24),
+			resultRing: cssPixels(7),
+			resultShadowY: cssPixels(8),
+			resultShadowBlur: cssPixels(28),
+			statusRing: cssPixels(6),
+			boundaryStroke: cssPixels(4),
+			pathStroke: cssPixels(2.5),
+			arrowStroke: cssPixels(3),
+			resultStroke: cssPixels(3),
+			haloStroke: cssPixels(1),
+			negativeHaloStroke: cssPixels(-1),
+			sourceHalo: cssPixels(2),
+			sourceOuterHalo: cssPixels(3),
+			arrowHead: cssPixels(9),
+			focusMargin: cssPixels(72)
+		};
+	}
 	//#endregion
 	//#region src/extension/hint/content.ts
 	var HINT_CHANNEL = "slant-hint-extension-v1";
+	var ZOOM_CHANNEL = "slant-hint-extension-zoom-v1";
 	var HINT_HOST_ID = "slant-hint-extension";
 	function objectValue(target, key) {
 		return target !== null && typeof target === "object" ? Reflect.get(target, key) : void 0;
@@ -3813,6 +4109,33 @@
 	function currentDomSignature() {
 		const elements = cellElements();
 		return `${elements.length}:${elements.map(stateToken).join("")}`;
+	}
+	function requestBrowserZoom() {
+		const runtime = objectValue(objectValue(globalThis, "chrome"), "runtime");
+		const sendMessage = objectValue(runtime, "sendMessage");
+		if (typeof sendMessage !== "function") return Promise.resolve(1);
+		return new Promise((resolve) => {
+			let settled = false;
+			const finish = (value) => {
+				if (settled) return;
+				settled = true;
+				resolve(normalizeBrowserZoom(value));
+			};
+			const timeout = globalThis.setTimeout(() => finish(1), 800);
+			try {
+				Reflect.apply(sendMessage, runtime, [{
+					channel: ZOOM_CHANNEL,
+					type: "get-zoom"
+				}, (response) => {
+					globalThis.clearTimeout(timeout);
+					objectValue(runtime, "lastError");
+					finish(objectValue(response, "zoomFactor"));
+				}]);
+			} catch {
+				globalThis.clearTimeout(timeout);
+				finish(1);
+			}
+		});
 	}
 	function resultingOrientation(conclusion) {
 		if (conclusion.kind === "report-contradiction") return null;
@@ -3873,6 +4196,34 @@
 				kind: "fixed"
 			}];
 		});
+	}
+	function validCell(width, height, cell) {
+		return cell.r >= 0 && cell.r < height && cell.c >= 0 && cell.c < width;
+	}
+	function vertexAnchorCell(width, height, vertex) {
+		if (vertex.r < 0 || vertex.r > height || vertex.c < 0 || vertex.c > width) return null;
+		return {
+			r: Math.min(vertex.r, height - 1),
+			c: Math.min(vertex.c, width - 1)
+		};
+	}
+	function geometryCells(active, observation, includeResults) {
+		const cells = /* @__PURE__ */ new Map();
+		const add = (cell) => {
+			if (cell !== null && validCell(active.summary.width, active.summary.height, cell)) cells.set(`${cell.r},${cell.c}`, cell);
+		};
+		for (const cell of observation.regionCells) add(cell);
+		for (const edge of observation.edges) add(edge.cell);
+		for (const cell of observation.sameDirectionChainCells) add(cell);
+		for (const vertex of observation.sourceVertices) add(vertexAnchorCell(active.summary.width, active.summary.height, vertex));
+		for (const arrow of observation.falseExitArrows) {
+			add(vertexAnchorCell(active.summary.width, active.summary.height, arrow.from));
+			add(vertexAnchorCell(active.summary.width, active.summary.height, arrow.to));
+		}
+		if (includeResults) {
+			for (const conclusion of active.step.conclusions) if (conclusion.kind !== "report-contradiction") add(conclusion.cell);
+		}
+		return [...cells.values()];
 	}
 	var EMPTY_OBSERVATION_EXTRAS = {
 		sourceVertices: [],
@@ -3942,7 +4293,7 @@
 		const ruleId = step.rule.id;
 		if (ruleId.startsWith("SL-CYC-")) {
 			const edges = fixedEdges(active, highlightedCells(step, /* @__PURE__ */ new Set(["cycle-path"])));
-			if (ruleId === "SL-CYC-202") edges.push(...premiseEdges(step.premises.dangerousPair));
+			if (ruleId === "SL-CYC-202") edges.push(...premiseEdges(step.premises.dangerousGroup ?? step.premises.dangerousPair));
 			const clueRegion = ruleId === "SL-CYC-202" ? cellsAroundHighlightedVertices(active, /* @__PURE__ */ new Set(["clue", "premise-chain"])) : [];
 			return edges.length === 0 && clueRegion.length === 0 ? {
 				regionCells: step.involved.cells,
@@ -3995,22 +4346,22 @@
 		const shadow = host.attachShadow({ mode: "open" });
 		shadow.innerHTML = `
     <style>
-      :host{--hint-color:#9eddb9;position:fixed;right:22px;bottom:22px;z-index:2147483647;font:14px/1.5 system-ui,"Microsoft YaHei",sans-serif;color:#17212b}
-      :host([data-difficulty="intro"]){--hint-color:#b7e7c8}:host([data-difficulty="basic"]){--hint-color:#70d29a}:host([data-difficulty="advanced"]){--hint-color:#f0d15e}:host([data-difficulty="path"]){--hint-color:#dda22f}:host([data-difficulty="same-direction"]){--hint-color:#e6746d}
+      :host{--hint-color:#00a66a;--lamp-size:56px;--lamp-offset:22px;--lamp-border:2px;--lamp-font:28px;--badge-size:22px;--badge-negative-offset:-5px;--badge-border:2px;--badge-font:15px;--hover-shift:-1px;--lamp-shadow-y:6px;--lamp-shadow-blur:22px;--badge-shadow-y:2px;--badge-shadow-blur:7px;--focus-ring:5px;--focus-shadow-y:7px;--focus-shadow-blur:24px;--result-ring:7px;--result-shadow-y:8px;--result-shadow-blur:28px;--status-ring:6px;--stroke-boundary:4px;--stroke-path:2.5px;--stroke-arrow:3px;--stroke-result:3px;--stroke-halo:1px;--negative-stroke-halo:-1px;--source-halo:2px;--source-outer-halo:3px;--arrow-head:9px;position:fixed;right:var(--lamp-offset);bottom:var(--lamp-offset);z-index:2147483647;font:14px/1.5 system-ui,"Microsoft YaHei",sans-serif;color:#17212b}
+      :host([data-difficulty="intro"]){--hint-color:#00a66a}:host([data-difficulty="basic"]){--hint-color:#008a58}:host([data-difficulty="advanced"]){--hint-color:#d39a00}:host([data-difficulty="path"]){--hint-color:#b96800}:host([data-difficulty="same-direction"]){--hint-color:#d9342b}
       *{box-sizing:border-box}.wrap{position:relative}
-      .lamp{position:relative;z-index:3;width:54px;height:54px;border:2px solid #14786e;border-radius:50%;background:#fff7c7;color:#725500;font-size:27px;cursor:pointer;box-shadow:0 6px 22px #0003;transition:background .16s,box-shadow .16s,filter .16s,transform .16s}
-      .lamp::after{position:absolute;right:-5px;bottom:-5px;display:grid;place-items:center;width:22px;height:22px;border:2px solid #fff;border-radius:50%;color:#fff;font:800 15px/1 system-ui,sans-serif;opacity:0;content:"";box-shadow:0 2px 7px #0003}
-      .lamp:hover{transform:translateY(-1px)}.lamp:disabled{cursor:wait;opacity:.78;animation:pulse .8s ease-in-out infinite alternate}
-      :host([data-hint-stage="focus"]) .lamp{background:#ffe77a;filter:saturate(1.2);box-shadow:0 0 0 5px #ffe77a55,0 7px 24px #b88a274d}
-      :host([data-hint-stage="result"]) .lamp{background:#ffc928;filter:saturate(1.4);box-shadow:0 0 0 7px #ffd23566,0 8px 28px #b8782759}
-      :host([data-status="solved"]) .lamp{border-color:#22845c;background:#dcf5e6;box-shadow:0 0 0 6px #75cc9b42,0 6px 22px #0002}:host([data-status="solved"]) .lamp::after{background:#23875e;content:"✓";opacity:1}
+      .lamp{position:relative;z-index:3;width:var(--lamp-size);height:var(--lamp-size);padding:0;border:var(--lamp-border) solid #14786e;border-radius:50%;background:#fff7c7;color:#725500;font-size:var(--lamp-font);cursor:pointer;box-shadow:0 var(--lamp-shadow-y) var(--lamp-shadow-blur) #0003;transition:background .16s,box-shadow .16s,filter .16s,transform .16s}
+      .lamp::after{position:absolute;right:var(--badge-negative-offset);bottom:var(--badge-negative-offset);display:grid;place-items:center;width:var(--badge-size);height:var(--badge-size);border:var(--badge-border) solid #fff;border-radius:50%;color:#fff;font:800 var(--badge-font)/1 system-ui,sans-serif;opacity:0;content:"";box-shadow:0 var(--badge-shadow-y) var(--badge-shadow-blur) #0003}
+      .lamp:hover{transform:translateY(var(--hover-shift))}.lamp:disabled{cursor:wait;opacity:.78;animation:pulse .8s ease-in-out infinite alternate}
+      :host([data-hint-stage="focus"]) .lamp{background:#ffe77a;filter:saturate(1.28);box-shadow:0 0 0 var(--focus-ring) #ffe77a66,0 var(--focus-shadow-y) var(--focus-shadow-blur) #b88a2759}
+      :host([data-hint-stage="result"]) .lamp{background:#ffc928;filter:saturate(1.5);box-shadow:0 0 0 var(--result-ring) #ffd23577,0 var(--result-shadow-y) var(--result-shadow-blur) #b8782766}
+      :host([data-status="solved"]) .lamp{border-color:#22845c;background:#dcf5e6;box-shadow:0 0 0 var(--status-ring) #75cc9b52,0 var(--lamp-shadow-y) var(--lamp-shadow-blur) #0002}:host([data-status="solved"]) .lamp::after{background:#23875e;content:"✓";opacity:1}
       :host([data-status="stalled"]) .lamp{border-color:#858d8b;background:#ecefed;filter:grayscale(.7)}:host([data-status="stalled"]) .lamp::after{background:#7d8583;content:"…";opacity:1}
-      :host([data-status="contradiction"]) .lamp{border-color:#ba3d38;background:#ffe0dd;box-shadow:0 0 0 6px #d9575040,0 6px 22px #0002}:host([data-status="contradiction"]) .lamp::after{background:#c3443e;content:"!";opacity:1}
+      :host([data-status="contradiction"]) .lamp{border-color:#ba3d38;background:#ffe0dd;box-shadow:0 0 0 var(--status-ring) #d9575050,0 var(--lamp-shadow-y) var(--lamp-shadow-blur) #0002}:host([data-status="contradiction"]) .lamp::after{background:#c3443e;content:"!";opacity:1}
       :host([data-status="error"]) .lamp{border-color:#c06a32;background:#ffe8d3}:host([data-status="error"]) .lamp::after{background:#c36a31;content:"×";opacity:1}
       @keyframes pulse{from{filter:brightness(1)}to{filter:brightness(1.18)}}
-      .highlight-layer{position:fixed;inset:0;z-index:1;pointer-events:none}.region-boundary,.path-line,.candidate-line,.source-path-line,.false-exit-arrow,.same-direction-chain-line,.result-line{position:absolute;pointer-events:none;transform-origin:0 50%}.region-boundary{height:3px;border-radius:999px;background:var(--hint-color);opacity:.94}.path-line{height:2px;background:var(--hint-color)}.candidate-line{height:0;border-top:2px dashed var(--hint-color)}.source-path-line{height:2px;background:#287fd1}.source-vertex{position:absolute;border:2px solid #287fd1;border-radius:50%;background:transparent;box-shadow:0 0 0 3px #287fd11f;transform:translate(-50%,-50%);pointer-events:none}.false-exit-arrow{height:2px;background:#d5443f}.same-direction-chain-line{height:2px;border-radius:999px;background:#e43d35;box-shadow:0 0 0 1px #ffffffd9}.same-direction-chain-marker{position:absolute;border-radius:50%;transform:translate(-50%,-50%);pointer-events:none}.same-direction-chain-marker.is-endpoint{border:2px solid #e43d35;background:#fff;box-shadow:0 0 0 1px #ffffffd9}.same-direction-chain-marker.is-intermediate{border:1px solid #fff;background:#e43d35;box-shadow:0 0 0 1px #ffffffa6}.false-exit-arrow::after,.false-exit-arrow.is-double::before{position:absolute;top:50%;width:8px;height:8px;content:"";pointer-events:none}.false-exit-arrow::after{right:-1px;border-top:2px solid #d5443f;border-right:2px solid #d5443f;transform:translateY(-50%) rotate(45deg)}.false-exit-arrow.is-double::before{left:-1px;border-bottom:2px solid #d5443f;border-left:2px solid #d5443f;transform:translateY(-50%) rotate(45deg)}.result-line{height:2px;background:#07865e}
+      @keyframes locate-pulse{0%,100%{filter:brightness(1);opacity:1}45%{filter:brightness(1.28) saturate(1.35);opacity:.72}}
+      .highlight-layer{position:fixed;inset:0;z-index:1;overflow:visible;pointer-events:none}.highlight-layer.is-locating>*{animation:locate-pulse .42s ease-in-out 2}.region-boundary,.path-line,.candidate-line,.source-path-line,.false-exit-arrow,.same-direction-chain-line,.result-line{position:absolute;pointer-events:none;transform-origin:0 50%}.region-boundary{height:var(--stroke-boundary);border-radius:999px;background:var(--hint-color);box-shadow:0 0 0 var(--stroke-halo) #ffffffe6}.path-line{height:var(--stroke-path);background:var(--hint-color);box-shadow:0 0 0 var(--stroke-halo) #ffffffe6}.candidate-line{height:0;border-top:var(--stroke-path) dashed var(--hint-color);filter:drop-shadow(0 0 var(--stroke-halo) #fff)}.source-path-line{height:var(--stroke-path);background:#006fc9;box-shadow:0 0 0 var(--stroke-halo) #fffffff0}.source-vertex{position:absolute;border:var(--stroke-path) solid #006fc9;border-radius:50%;background:transparent;box-shadow:0 0 0 var(--source-halo) #006fc933,0 0 0 var(--source-outer-halo) #fff;transform:translate(-50%,-50%);pointer-events:none}.false-exit-arrow{height:var(--stroke-arrow);background:#d52f2f;box-shadow:0 0 0 var(--stroke-halo) #fffffff0}.same-direction-chain-line{height:var(--stroke-path);border-radius:999px;background:#d9342b;box-shadow:0 0 0 var(--stroke-halo) #fffffff0}.same-direction-chain-marker{position:absolute;border-radius:50%;transform:translate(-50%,-50%);pointer-events:none}.same-direction-chain-marker.is-endpoint{border:var(--stroke-path) solid #d9342b;background:#fff;box-shadow:0 0 0 var(--stroke-halo) #fffffff0}.same-direction-chain-marker.is-intermediate{border:var(--stroke-halo) solid #fff;background:#d9342b;box-shadow:0 0 0 var(--stroke-halo) #ffffffa6}.false-exit-arrow::after,.false-exit-arrow.is-double::before{position:absolute;top:50%;width:var(--arrow-head);height:var(--arrow-head);content:"";pointer-events:none}.false-exit-arrow::after{right:var(--negative-stroke-halo);border-top:var(--stroke-arrow) solid #d52f2f;border-right:var(--stroke-arrow) solid #d52f2f;transform:translateY(-50%) rotate(45deg)}.false-exit-arrow.is-double::before{left:var(--negative-stroke-halo);border-bottom:var(--stroke-arrow) solid #d52f2f;border-left:var(--stroke-arrow) solid #d52f2f;transform:translateY(-50%) rotate(45deg)}.result-line{height:var(--stroke-result);background:#00895f;box-shadow:0 0 0 var(--stroke-halo) #fffffff0}
       .status-live{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
-      @media(max-width:640px){:host{right:12px;bottom:12px}.lamp{width:50px;height:50px}}
     </style>
     <div class="highlight-layer" aria-hidden="true"></div>
     <div class="wrap">
@@ -4029,8 +4380,58 @@
 		let stage = "idle";
 		let capturedSignature = "";
 		let renderFrame = 0;
+		let geometryFrame = 0;
+		let geometryTrackingUntil = 0;
+		let lastGeometrySignature = "";
+		let attentionTimer = 0;
+		let boardElements = [];
+		let visualMetrics = hintVisualMetrics(1);
+		function setLengthVariable(name, value) {
+			host.style.setProperty(name, `${value}px`);
+		}
+		function applyBrowserZoom(value) {
+			const next = hintVisualMetrics(value);
+			if (next.zoomFactor === visualMetrics.zoomFactor) return;
+			visualMetrics = next;
+			setLengthVariable("--lamp-size", next.lampSize);
+			setLengthVariable("--lamp-offset", next.lampOffset);
+			setLengthVariable("--lamp-border", next.lampBorder);
+			setLengthVariable("--lamp-font", next.lampFont);
+			setLengthVariable("--badge-size", next.badgeSize);
+			setLengthVariable("--badge-negative-offset", next.badgeNegativeOffset);
+			setLengthVariable("--badge-border", next.badgeBorder);
+			setLengthVariable("--badge-font", next.badgeFont);
+			setLengthVariable("--hover-shift", next.hoverShift);
+			setLengthVariable("--lamp-shadow-y", next.lampShadowY);
+			setLengthVariable("--lamp-shadow-blur", next.lampShadowBlur);
+			setLengthVariable("--badge-shadow-y", next.badgeShadowY);
+			setLengthVariable("--badge-shadow-blur", next.badgeShadowBlur);
+			setLengthVariable("--focus-ring", next.focusRing);
+			setLengthVariable("--focus-shadow-y", next.focusShadowY);
+			setLengthVariable("--focus-shadow-blur", next.focusShadowBlur);
+			setLengthVariable("--result-ring", next.resultRing);
+			setLengthVariable("--result-shadow-y", next.resultShadowY);
+			setLengthVariable("--result-shadow-blur", next.resultShadowBlur);
+			setLengthVariable("--status-ring", next.statusRing);
+			setLengthVariable("--stroke-boundary", next.boundaryStroke);
+			setLengthVariable("--stroke-path", next.pathStroke);
+			setLengthVariable("--stroke-arrow", next.arrowStroke);
+			setLengthVariable("--stroke-result", next.resultStroke);
+			setLengthVariable("--stroke-halo", next.haloStroke);
+			setLengthVariable("--negative-stroke-halo", next.negativeHaloStroke);
+			setLengthVariable("--source-halo", next.sourceHalo);
+			setLengthVariable("--source-outer-halo", next.sourceOuterHalo);
+			setLengthVariable("--arrow-head", next.arrowHead);
+			scheduleHighlightRender();
+			startGeometryTracking(500);
+		}
 		function clearHighlights() {
 			highlightLayer.replaceChildren();
+		}
+		function cancelLocatorPulse() {
+			globalThis.clearTimeout(attentionTimer);
+			attentionTimer = 0;
+			highlightLayer.classList.remove("is-locating");
 		}
 		function resetHint() {
 			active = null;
@@ -4042,20 +4443,32 @@
 			lamp.ariaLabel = "运行 Slant 灯泡提示";
 			lamp.title = "运行 Slant 灯泡提示";
 			statusLive.textContent = "";
+			boardElements = [];
+			lastGeometrySignature = "";
+			cancelLocatorPulse();
 			clearHighlights();
 		}
-		function rectsForBoard(width, height) {
-			const elements = cellElements();
+		function currentBoardElements() {
+			if (boardElements.length > 0 && boardElements.every((element) => element.isConnected)) return boardElements;
+			boardElements = cellElements();
+			return boardElements;
+		}
+		function rectsForBoard(width, height, cells) {
+			const elements = currentBoardElements();
 			if (elements.length !== width * height) return null;
-			return elements.map((element) => {
+			const rects = new Array(elements.length);
+			for (const cell of cells) {
+				const element = elements[cell.r * width + cell.c];
+				if (element === void 0) continue;
 				const rect = element.getBoundingClientRect();
-				return {
+				rects[cell.r * width + cell.c] = {
 					left: rect.left,
 					top: rect.top,
 					width: rect.width,
 					height: rect.height
 				};
-			});
+			}
+			return rects;
 		}
 		function appendSegment(segment, className) {
 			const dx = segment.to.x - segment.from.x;
@@ -4066,7 +4479,7 @@
 				left: `${segment.from.x}px`,
 				top: `${segment.from.y}px`,
 				width: `${Math.hypot(dx, dy)}px`,
-				transform: `rotate(${Math.atan2(dy, dx)}rad)`
+				transform: `translateY(-50%) rotate(${Math.atan2(dy, dx)}rad)`
 			});
 			highlightLayer.append(line);
 			return line;
@@ -4096,14 +4509,17 @@
 		function renderHighlights() {
 			clearHighlights();
 			if (active === null || stage === "idle") return;
-			const rects = rectsForBoard(active.summary.width, active.summary.height);
-			if (rects === null) return;
 			const observation = observationGeometry(active);
+			const cells = geometryCells(active, observation, stage === "result");
+			const rects = rectsForBoard(active.summary.width, active.summary.height, cells);
+			if (rects === null) return;
+			const sampleRect = rects.find((rect) => rect !== void 0);
+			if (sampleRect === void 0) return;
 			const boundaries = buildRegionBoundaryLayout(active.summary.width, active.summary.height, rects, observation.regionCells);
 			for (const segment of boundaries) appendSegment(segment, "region-boundary");
 			const pathSegments = buildDiagonalEdgeLayout(active.summary.width, active.summary.height, rects, observation.edges);
 			for (const segment of pathSegments) appendSegment(segment, segment.edge.kind === "candidate" ? "candidate-line" : segment.edge.kind === "source" ? "source-path-line" : "path-line");
-			const markerSize = Math.max(16, Math.min(34, Math.min(rects[0]?.width ?? 24, rects[0]?.height ?? 24) * .72));
+			const markerSize = Math.max(16 / visualMetrics.zoomFactor, Math.min(34 / visualMetrics.zoomFactor, Math.min(sampleRect.width, sampleRect.height) * .72));
 			for (const marker of buildVertexHighlightLayout(active.summary.width, active.summary.height, rects, observation.sourceVertices)) appendSourceVertex(marker.point, markerSize);
 			for (const segment of buildVertexArrowLayout(active.summary.width, active.summary.height, rects, observation.falseExitArrows)) appendSegment(segment, segment.arrow.kind === "double" ? "false-exit-arrow is-double" : "false-exit-arrow");
 			const sameDirectionChain = buildCellCenterChainLayout(active.summary.width, active.summary.height, rects, observation.sameDirectionChainCells);
@@ -4121,8 +4537,108 @@
 				}
 				for (const segment of buildDiagonalEdgeLayout(active.summary.width, active.summary.height, rects, resultEdges)) appendSegment(segment, "result-line");
 			}
-			const shortSide = Math.min(rects[0]?.width ?? 24, rects[0]?.height ?? 24);
-			for (const marker of sameDirectionChain.markers) appendSameDirectionMarker(marker, marker.kind === "endpoint" ? Math.max(7, Math.min(12, shortSide * .24)) : Math.max(4, Math.min(7, shortSide * .13)));
+			const shortSide = Math.min(sampleRect.width, sampleRect.height);
+			for (const marker of sameDirectionChain.markers) appendSameDirectionMarker(marker, marker.kind === "endpoint" ? Math.max(7 / visualMetrics.zoomFactor, Math.min(12 / visualMetrics.zoomFactor, shortSide * .24)) : Math.max(4 / visualMetrics.zoomFactor, Math.min(7 / visualMetrics.zoomFactor, shortSide * .13)));
+			lastGeometrySignature = geometrySignature();
+		}
+		function geometrySignature() {
+			if (active === null || stage === "idle") return "";
+			const current = active;
+			const cells = geometryCells(current, observationGeometry(current), stage === "result");
+			const elements = currentBoardElements();
+			if (elements.length !== current.summary.width * current.summary.height) return "missing";
+			const values = [];
+			for (const cell of cells) {
+				const element = elements[cell.r * current.summary.width + cell.c];
+				if (element === void 0) {
+					values.push("missing");
+					continue;
+				}
+				const rect = element.getBoundingClientRect();
+				values.push(...[
+					rect.left,
+					rect.top,
+					rect.width,
+					rect.height
+				].map((part) => Math.round(part * 10) / 10));
+			}
+			return `${visualMetrics.zoomFactor}:${globalThis.innerWidth}:${globalThis.innerHeight}:${values.join(",")}`;
+		}
+		function trackGeometry(timestamp) {
+			geometryFrame = 0;
+			if (active === null || stage === "idle") return;
+			const signature = geometrySignature();
+			if (signature !== lastGeometrySignature) {
+				lastGeometrySignature = signature;
+				renderHighlights();
+			}
+			if (timestamp < geometryTrackingUntil) geometryFrame = globalThis.requestAnimationFrame(trackGeometry);
+		}
+		function startGeometryTracking(duration = 700) {
+			if (active === null || stage === "idle") return;
+			geometryTrackingUntil = Math.max(geometryTrackingUntil, performance.now() + duration);
+			if (geometryFrame === 0) geometryFrame = globalThis.requestAnimationFrame(trackGeometry);
+		}
+		function triggerLocatorPulse(delay = 0) {
+			window.clearTimeout(attentionTimer);
+			attentionTimer = window.setTimeout(() => {
+				highlightLayer.classList.remove("is-locating");
+				highlightLayer.offsetWidth;
+				highlightLayer.classList.add("is-locating");
+				attentionTimer = window.setTimeout(() => {
+					highlightLayer.classList.remove("is-locating");
+					attentionTimer = 0;
+				}, 920);
+			}, delay);
+		}
+		function locateActiveHint() {
+			if (active === null || stage === "idle") return;
+			const observation = observationGeometry(active);
+			const cells = geometryCells(active, observation, stage === "result");
+			const elements = currentBoardElements();
+			const targets = cells.flatMap((cell) => {
+				const element = elements[cell.r * active.summary.width + cell.c];
+				return element === void 0 ? [] : [{
+					element,
+					rect: element.getBoundingClientRect()
+				}];
+			});
+			const bounds = viewportBounds(targets.map(({ rect }) => ({
+				left: rect.left,
+				top: rect.top,
+				width: rect.width,
+				height: rect.height
+			})));
+			const viewport = globalThis.visualViewport;
+			const viewportWidth = viewport?.width ?? globalThis.innerWidth;
+			const viewportHeight = viewport?.height ?? globalThis.innerHeight;
+			if (bounds === null || !needsViewportFocus(bounds, viewportWidth, viewportHeight, visualMetrics.focusMargin)) {
+				triggerLocatorPulse();
+				return;
+			}
+			const centerX = (bounds.left + bounds.right) / 2;
+			const centerY = (bounds.top + bounds.bottom) / 2;
+			const anchor = targets.reduce((best, target) => {
+				const targetX = target.rect.left + target.rect.width / 2;
+				const targetY = target.rect.top + target.rect.height / 2;
+				const distance = Math.hypot(targetX - centerX, targetY - centerY);
+				if (best === null) return target;
+				const bestX = best.rect.left + best.rect.width / 2;
+				const bestY = best.rect.top + best.rect.height / 2;
+				return distance < Math.hypot(bestX - centerX, bestY - centerY) ? target : best;
+			}, null);
+			if (anchor === null) return;
+			try {
+				anchor.element.scrollIntoView({
+					behavior: "smooth",
+					block: "center",
+					inline: "center"
+				});
+			} catch {
+				anchor.element.scrollIntoView();
+			}
+			startGeometryTracking(1200);
+			triggerLocatorPulse(420);
 		}
 		function scheduleHighlightRender() {
 			if (renderFrame !== 0) return;
@@ -4138,13 +4654,15 @@
 			lamp.ariaLabel = "已显示结论；再次点击清除提示";
 			lamp.title = "";
 			statusLive.textContent = "已显示结论。";
-			scheduleHighlightRender();
+			renderHighlights();
+			locateActiveHint();
 		}
 		function showMessage(analysis) {
 			active = null;
 			stage = "idle";
 			host.dataset.hintStage = "idle";
 			delete host.dataset.difficulty;
+			cancelLocatorPulse();
 			clearHighlights();
 			host.dataset.status = analysis.kind === "invalid" ? "error" : analysis.kind;
 			lamp.ariaLabel = analysis.message;
@@ -4158,6 +4676,7 @@
 			try {
 				const capture = await requestCapture();
 				const elements = cellElements();
+				boardElements = elements;
 				const analysis = analyzePuzzleSlantCurrentPosition({
 					...capture,
 					hostname: globalThis.location.hostname,
@@ -4174,6 +4693,7 @@
 					lamp.title = "";
 					statusLive.textContent = "已显示观察位置。";
 					renderHighlights();
+					locateActiveHint();
 				} else showMessage(analysis);
 			} catch (error) {
 				showMessage({
@@ -4189,21 +4709,56 @@
 			else if (active !== null && stage === "result") resetHint();
 			else loadFocus();
 		});
-		globalThis.addEventListener("resize", scheduleHighlightRender);
-		globalThis.addEventListener("scroll", scheduleHighlightRender, true);
-		const observer = new MutationObserver(() => {
+		const handleGeometryEvent = () => {
+			scheduleHighlightRender();
+			startGeometryTracking(750);
+		};
+		globalThis.addEventListener("resize", handleGeometryEvent);
+		globalThis.addEventListener("scroll", handleGeometryEvent, true);
+		globalThis.visualViewport?.addEventListener("resize", handleGeometryEvent);
+		globalThis.visualViewport?.addEventListener("scroll", handleGeometryEvent);
+		for (const eventName of [
+			"input",
+			"change",
+			"pointerup",
+			"wheel"
+		]) document.addEventListener(eventName, () => startGeometryTracking(eventName === "input" ? 1100 : 750), true);
+		const observer = new MutationObserver((records) => {
 			if (capturedSignature === "") return;
-			if (currentDomSignature() !== capturedSignature) resetHint();
+			if (records.some((record) => record.type === "childList" || record.attributeName === "class" && record.target instanceof Element && record.target.matches(".cell")) && currentDomSignature() !== capturedSignature) {
+				resetHint();
+				return;
+			}
+			if (records.some((record) => record.type === "childList")) boardElements = cellElements();
+			startGeometryTracking(900);
 		});
 		const game = document.querySelector("#game");
-		if (game !== null) observer.observe(game, {
-			subtree: true,
-			childList: true,
-			attributes: true,
-			attributeFilter: ["class"]
-		});
-		if (game instanceof HTMLElement && typeof ResizeObserver === "function") new ResizeObserver(scheduleHighlightRender).observe(game);
+		if (game !== null) {
+			observer.observe(game, {
+				subtree: true,
+				childList: true,
+				attributes: true,
+				attributeFilter: ["class", "style"]
+			});
+			let ancestor = game.parentElement;
+			while (ancestor !== null && ancestor !== document.documentElement) {
+				observer.observe(ancestor, {
+					attributes: true,
+					attributeFilter: ["class", "style"]
+				});
+				ancestor = ancestor.parentElement;
+			}
+		}
+		if (game instanceof HTMLElement && typeof ResizeObserver === "function") new ResizeObserver(handleGeometryEvent).observe(game);
+		const onMessage = objectValue(objectValue(objectValue(globalThis, "chrome"), "runtime"), "onMessage");
+		const addMessageListener = objectValue(onMessage, "addListener");
+		if (typeof addMessageListener === "function") Reflect.apply(addMessageListener, onMessage, [(message) => {
+			if (objectValue(message, "channel") !== ZOOM_CHANNEL || objectValue(message, "type") !== "zoom-changed") return false;
+			applyBrowserZoom(objectValue(message, "zoomFactor"));
+			return false;
+		}]);
 		document.documentElement.append(host);
+		requestBrowserZoom().then(applyBrowserZoom);
 	}
 	if (globalThis.location.hostname === "puzzle-slant.com" || globalThis.location.hostname.endsWith(".puzzle-slant.com")) mountHintLamp();
 	//#endregion
